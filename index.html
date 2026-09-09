@@ -252,6 +252,21 @@
     background:#08150ecc;border-radius:12px;padding:10px 14px;max-height:100px;overflow-y:auto;
   }
   .log-panel div{padding:1px 0;}
+  .give-chips-panel{
+    margin-top:14px;width:100%;max-width:700px;
+    background:#0c1f16aa;border:1px solid #2c4a38;border-radius:14px;
+    padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;
+  }
+  .give-chips-panel select, .give-chips-panel input[type=number]{
+    padding:8px 10px;border-radius:8px;border:1px solid #345943;background:#0c1f16;color:var(--cream);font-size:14px;
+  }
+  .give-chips-panel input[type=number]{width:90px;}
+  .give-chips-label{font-size:12.5px;color:#a9c3b3;width:100%;text-align:center;}
+  .countdown{
+    font-family:'Fraunces',serif;font-weight:700;color:var(--gold-bright);
+    font-size:13px;margin-left:6px;
+  }
+  .sitting-out{font-size:12px;color:#8fa89a;font-style:italic;margin-top:4px;}
   footer{margin-top:26px;font-size:12px;color:#5f8570;text-align:center;}
   a{color:var(--gold-bright);}
   @media (max-width:520px){
@@ -307,6 +322,7 @@
     </div>
 
     <div class="controls" id="controls"></div>
+    <div class="give-chips-panel" id="giveChipsPanel"></div>
     <div class="log-panel" id="logPanel"></div>
   </div>
 
@@ -350,6 +366,10 @@
 
   const MIN_BET=10;
   const START_CHIPS=1000;
+  const BET_SECONDS=25;
+  const TURN_SECONDS=20;
+  let betTimerHandle=null;
+  let turnTimerHandle=null;
 
   // Google STUN + free Open Relay TURN (needed so the connection also works
   // across mobile networks / strict firewalls, not just on the same WiFi).
@@ -384,9 +404,46 @@
     state.turnHandIndex=0;
     deck=freshDeck();
     for(const p of state.players){
-      p.hands=[]; p.bet=0; p.betConfirmed=false;
+      p.hands=[]; p.bet=0; p.betConfirmed=false; p.sittingOut=false;
     }
     log('Neue Runde — bitte setzen.');
+    armBetTimer();
+  }
+
+  function armBetTimer(){
+    if(betTimerHandle){ clearTimeout(betTimerHandle); betTimerHandle=null; }
+    state.betDeadline = Date.now()+BET_SECONDS*1000;
+    betTimerHandle=setTimeout(()=>{
+      if(state.phase!=='betting') return;
+      let anyConfirmed=false;
+      for(const p of state.players){
+        if(p.sittingOut) continue;
+        if(!p.betConfirmed){ p.sittingOut=true; log(p.name+' hat nicht rechtzeitig gesetzt und setzt aus.'); }
+        else anyConfirmed=true;
+      }
+      state.betDeadline=null;
+      if(anyConfirmed){ dealInitial(); }
+      else { log('Niemand hat gesetzt.'); broadcast(); }
+    }, BET_SECONDS*1000);
+  }
+
+  function clearTurnTimer(){
+    if(turnTimerHandle){ clearTimeout(turnTimerHandle); turnTimerHandle=null; }
+    if(state) state.turnDeadline=null;
+  }
+
+  function armTurnTimer(){
+    clearTurnTimer();
+    const cur=currentPlayerAndHand();
+    if(!cur) return;
+    const pid=cur.p.id;
+    const pname=cur.p.name;
+    state.turnDeadline = Date.now()+TURN_SECONDS*1000;
+    turnTimerHandle=setTimeout(()=>{
+      if(state.phase!=='playing') return;
+      log(pname+' hat nicht rechtzeitig reagiert — automatisch Stand.');
+      hostStand(pid);
+    }, TURN_SECONDS*1000);
   }
 
   function tryStartGame(){
@@ -397,39 +454,68 @@
 
   function hostAddBet(pid, amt){
     const p=state.players.find(x=>x.id===pid);
-    if(!p || state.phase!=='betting' || p.betConfirmed) return;
+    if(!p || state.phase!=='betting' || p.betConfirmed || p.sittingOut) return;
     if(amt==='clear'){ p.bet=0; broadcast(); return; }
     const newBet=p.bet+amt;
     if(newBet<=p.chips){ p.bet=newBet; broadcast(); }
   }
 
+  function hostSitOut(pid){
+    const p=state.players.find(x=>x.id===pid);
+    if(!p || state.phase!=='betting' || p.betConfirmed || p.sittingOut) return;
+    p.sittingOut=true;
+    p.bet=0;
+    log(p.name+' setzt diese Runde aus.');
+    const active=state.players.filter(x=>!x.sittingOut);
+    if(active.length>0 && active.every(x=>x.betConfirmed)){ dealInitial(); return; }
+    broadcast();
+  }
+
   function hostConfirmBet(pid){
     const p=state.players.find(x=>x.id===pid);
-    if(!p || state.phase!=='betting' || p.betConfirmed) return;
+    if(!p || state.phase!=='betting' || p.betConfirmed || p.sittingOut) return;
     if(p.bet<MIN_BET) return;
     p.chips-=p.bet;
     p.betConfirmed=true;
     log(p.name+' setzt '+p.bet+'.');
-    if(state.players.every(x=>x.betConfirmed)){
+    const active=state.players.filter(x=>!x.sittingOut);
+    if(active.length>0 && active.every(x=>x.betConfirmed)){
       dealInitial();
       return;
     }
     broadcast();
   }
 
+  function hostGiveChips(fromId, toId, amount){
+    if(['playing','dealerReveal','dealerPlay'].includes(state.phase)) return;
+    if(fromId===toId) return;
+    amount=Math.floor(Number(amount));
+    if(!(amount>0)) return;
+    const from=state.players.find(p=>p.id===fromId);
+    const to=state.players.find(p=>p.id===toId);
+    if(!from || !to) return;
+    if(from.chips<amount) return;
+    from.chips-=amount;
+    to.chips+=amount;
+    log(from.name+' gibt '+amount+' Chips an '+to.name+'.');
+    broadcast();
+  }
+
   function dealInitial(){
     state.phase='dealing';
+    const active=state.players.filter(p=>!p.sittingOut);
     for(const p of state.players){
+      if(p.sittingOut){ p.hands=[]; continue; }
       p.hands=[{cards:[deck.pop(),deck.pop()], bet:p.bet, status:'active', resultText:'', doubled:false, isAceSplit:false}];
     }
     state.dealer.hand=[deck.pop(),deck.pop()];
-    for(const p of state.players){
+    for(const p of active){
       const h=p.hands[0];
       if(isBlackjack(h.cards)) h.status='blackjack';
     }
     log('Karten wurden ausgeteilt.');
     state.phase='playing';
-    state.order=state.players.map(p=>p.id);
+    state.order=active.map(p=>p.id);
     state.turnIndex=0;
     state.turnHandIndex=0;
     skipToActive();
@@ -594,9 +680,12 @@
     }
     log(name + (reason==='kicked' ? ' wurde vom Host entfernt.' : ' hat den Tisch verlassen.'));
 
-    if(state.phase==='betting' && state.players.length>0 && state.players.every(x=>x.betConfirmed)){
-      dealInitial();
-      return;
+    if(state.phase==='betting'){
+      const active=state.players.filter(x=>!x.sittingOut);
+      if(active.length>0 && active.every(x=>x.betConfirmed)){
+        dealInitial();
+        return;
+      }
     }
     if(wasCurrentTurn && state.phase==='playing'){
       skipToActive();
@@ -623,6 +712,7 @@
 
   function broadcast(){
     if(!isHost) return;
+    if(state.phase==='playing'){ armTurnTimer(); } else { clearTurnTimer(); }
     const s=publicState();
     for(const id in conns){
       try{ conns[id].send({type:'state', state:s}); }catch(e){}
@@ -649,7 +739,7 @@
       isHost=true;
       state={
         phase:'lobby',
-        players:[{id:localId,name:localName,chips:START_CHIPS,hands:[],bet:0,betConfirmed:false}],
+        players:[{id:localId,name:localName,chips:START_CHIPS,hands:[],bet:0,betConfirmed:false,sittingOut:false}],
         dealer:{hand:[]},
         turnIndex:0,
         turnHandIndex:0,
@@ -687,7 +777,7 @@
     if(!data || !data.type) return;
     if(data.type==='join'){
       if(!state.players.find(p=>p.id===conn.peer)){
-        state.players.push({id:conn.peer,name:(data.name||'Gast').slice(0,16),chips:START_CHIPS,hands:[],bet:0,betConfirmed:false});
+        state.players.push({id:conn.peer,name:(data.name||'Gast').slice(0,16),chips:START_CHIPS,hands:[],bet:0,betConfirmed:false,sittingOut:false});
         log(data.name+' ist beigetreten.');
       }
       broadcast();
@@ -695,6 +785,8 @@
     }
     if(data.type==='bet'){ hostAddBet(conn.peer, data.amount); return; }
     if(data.type==='confirmBet'){ hostConfirmBet(conn.peer); return; }
+    if(data.type==='sitOut'){ hostSitOut(conn.peer); return; }
+    if(data.type==='giveChips'){ hostGiveChips(conn.peer, data.toId, data.amount); return; }
     if(data.type==='action'){
       if(data.move==='hit') hostHit(conn.peer);
       else if(data.move==='stand') hostStand(conn.peer);
@@ -764,6 +856,8 @@
     if(isHost){
       if(msg.type==='bet') hostAddBet(localId, msg.amount);
       if(msg.type==='confirmBet') hostConfirmBet(localId);
+      if(msg.type==='sitOut') hostSitOut(localId);
+      if(msg.type==='giveChips') hostGiveChips(localId, msg.toId, msg.amount);
       if(msg.type==='action' && msg.move==='hit') hostHit(localId);
       if(msg.type==='action' && msg.move==='stand') hostStand(localId);
       if(msg.type==='action' && msg.move==='double') hostDouble(localId);
@@ -857,6 +951,12 @@
         preBet.textContent='Einsatz: '+p.bet;
         seat.appendChild(preBet);
       }
+      if(p.sittingOut && s.phase!=='lobby'){
+        const soDiv=document.createElement('div');
+        soDiv.className='sitting-out';
+        soDiv.textContent='Setzt aus';
+        seat.appendChild(soDiv);
+      }
 
       const handsWrap=document.createElement('div');
       handsWrap.style.display='flex';
@@ -934,12 +1034,17 @@
     } else if(s.phase==='betting'){
       if(!me){
         controls.innerHTML='<div class="hint">Du schaust zu.</div>';
+      } else if(me.sittingOut){
+        controls.innerHTML='<div class="hint">Du setzt diese Runde aus.</div>';
       } else if(me.betConfirmed){
-        controls.innerHTML='<div class="hint">Einsatz platziert — warte auf die anderen Spieler…</div>';
+        const hint=document.createElement('div');
+        hint.className='hint';
+        hint.innerHTML='Einsatz platziert — warte auf die anderen Spieler… <span class="countdown" data-deadline="'+(s.betDeadline||'')+'"></span>';
+        controls.appendChild(hint);
       } else {
         const pendingDiv=document.createElement('div');
         pendingDiv.className='pending-bet';
-        pendingDiv.textContent='Einsatz: '+me.bet+' Chips';
+        pendingDiv.innerHTML='Einsatz: '+me.bet+' Chips <span class="countdown" data-deadline="'+(s.betDeadline||'')+'"></span>';
         controls.appendChild(pendingDiv);
 
         const chipsRow=document.createElement('div');
@@ -958,17 +1063,31 @@
         const clearBtn=document.createElement('button');
         clearBtn.className='btn secondary small'; clearBtn.textContent='Zurücksetzen';
         clearBtn.onclick=()=>sendOrLocal({type:'bet',amount:'clear'});
+        const sitOutBtn=document.createElement('button');
+        sitOutBtn.className='btn secondary small'; sitOutBtn.textContent='Aussetzen';
+        sitOutBtn.onclick=()=>sendOrLocal({type:'sitOut'});
         const confirmBtn=document.createElement('button');
         confirmBtn.className='btn'; confirmBtn.textContent='Setzen bestätigen';
         confirmBtn.disabled = me.bet < MIN_BET;
         confirmBtn.onclick=()=>sendOrLocal({type:'confirmBet'});
-        row.appendChild(clearBtn); row.appendChild(confirmBtn);
+        row.appendChild(clearBtn); row.appendChild(sitOutBtn); row.appendChild(confirmBtn);
         controls.appendChild(row);
+      }
+      if(s.players.length>0 && s.players.every(x=>x.sittingOut) && isHost){
+        const btn=document.createElement('button');
+        btn.className='btn'; btn.textContent='Neue Runde starten';
+        btn.onclick=tryStartGame;
+        controls.appendChild(btn);
       }
     } else if(s.phase==='playing'){
       const turnPlayer = s.players.find(p=>p.id===s.order[s.turnIndex]);
       const activeHand = turnPlayer ? turnPlayer.hands[s.turnHandIndex] : null;
       if(me && turnPlayer && turnPlayer.id===localId && activeHand && activeHand.status==='active'){
+        const timerDiv=document.createElement('div');
+        timerDiv.className='hint';
+        timerDiv.innerHTML='Du bist am Zug <span class="countdown" data-deadline="'+(s.turnDeadline||'')+'"></span>';
+        controls.appendChild(timerDiv);
+
         const row=document.createElement('div');
         row.className='action-row';
 
@@ -997,7 +1116,7 @@
         controls.appendChild(row);
       } else {
         const handNote = (turnPlayer && turnPlayer.hands.length>1) ? ' (Hand '+(s.turnHandIndex+1)+')' : '';
-        controls.innerHTML='<div class="hint">Am Zug: '+(turnPlayer?turnPlayer.name:'—')+handNote+'…</div>';
+        controls.innerHTML='<div class="hint">Am Zug: '+(turnPlayer?turnPlayer.name:'—')+handNote+' <span class="countdown" data-deadline="'+(s.turnDeadline||'')+'"></span></div>';
       }
     } else if(s.phase==='dealerReveal' || s.phase==='dealerPlay'){
       controls.innerHTML='<div class="hint">Der Dealer muss bis 17 ziehen…</div>';
@@ -1012,6 +1131,41 @@
       }
     }
 
+    // give chips panel
+    const giveChipsPanel=document.getElementById('giveChipsPanel');
+    giveChipsPanel.innerHTML='';
+    const chipsAllowed = !['playing','dealerReveal','dealerPlay'].includes(s.phase);
+    const others = s.players.filter(p=>p.id!==localId);
+    if(me && chipsAllowed && others.length>0){
+      const label=document.createElement('div');
+      label.className='give-chips-label';
+      label.textContent='Chips an einen Mitspieler abgeben';
+      giveChipsPanel.appendChild(label);
+
+      const select=document.createElement('select');
+      others.forEach(p=>{
+        const opt=document.createElement('option');
+        opt.value=p.id; opt.textContent=p.name;
+        select.appendChild(opt);
+      });
+
+      const amountInput=document.createElement('input');
+      amountInput.type='number'; amountInput.min='1'; amountInput.max=String(me.chips); amountInput.value='50';
+
+      const sendBtn=document.createElement('button');
+      sendBtn.className='btn secondary small'; sendBtn.textContent='Geben';
+      sendBtn.onclick=()=>{
+        const amt=parseInt(amountInput.value,10);
+        if(!amt || amt<1) return;
+        if(amt>me.chips){ alert('Du hast nicht genug Chips.'); return; }
+        sendOrLocal({type:'giveChips', toId:select.value, amount:amt});
+      };
+
+      giveChipsPanel.appendChild(select);
+      giveChipsPanel.appendChild(amountInput);
+      giveChipsPanel.appendChild(sendBtn);
+    }
+
     // log
     const logPanel=document.getElementById('logPanel');
     logPanel.innerHTML = s.log.slice(-8).map(l=>'<div>'+l+'</div>').join('');
@@ -1019,6 +1173,16 @@
 
     prevRenderState = s;
   }
+
+  // ---------- Countdown ticker (updates without a full re-render) ----------
+  setInterval(()=>{
+    document.querySelectorAll('.countdown').forEach(el=>{
+      const deadline=parseInt(el.dataset.deadline,10);
+      if(!deadline){ el.textContent=''; return; }
+      const remain=Math.max(0, Math.ceil((deadline-Date.now())/1000));
+      el.textContent='('+remain+'s)';
+    });
+  }, 500);
 
   // ---------- Landing screen wiring ----------
   document.getElementById('hostBtn').onclick=()=>{
