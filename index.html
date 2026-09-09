@@ -195,8 +195,17 @@
     padding:12px 14px;
     min-width:150px;
     display:flex;flex-direction:column;align-items:center;
+    position:relative;
     transition:box-shadow .2s ease, border-color .2s ease;
   }
+  .kick-btn{
+    position:absolute; top:6px; right:6px;
+    width:20px;height:20px;border-radius:50%;
+    border:none; background:#7a2020; color:#fff; font-size:13px; line-height:1;
+    cursor:pointer; display:flex; align-items:center; justify-content:center;
+    opacity:.7; transition:opacity .15s ease, transform .15s ease;
+  }
+  .kick-btn:hover{ opacity:1; transform:scale(1.12); background:#a4222c; }
   .seat.me{border-color:#7fd6a3aa;}
   .seat .name{font-weight:700;font-size:14px;margin-bottom:2px;text-align:center;}
   .seat .chips{font-size:12px;color:#d9caa0;margin-bottom:8px;}
@@ -570,6 +579,38 @@
     broadcast();
   }
 
+  function removePlayer(pid, reason){
+    const p = state.players.find(x=>x.id===pid);
+    const name = p ? p.name : 'Ein Spieler';
+    const wasCurrentTurn = state.phase==='playing' && state.order && state.order[state.turnIndex]===pid;
+    state.players = state.players.filter(x=>x.id!==pid);
+    if(state.order){
+      const idx=state.order.indexOf(pid);
+      if(idx!==-1){
+        if(idx<state.turnIndex) state.turnIndex--;
+        else if(idx===state.turnIndex) state.turnHandIndex=0;
+        state.order.splice(idx,1);
+      }
+    }
+    log(name + (reason==='kicked' ? ' wurde vom Host entfernt.' : ' hat den Tisch verlassen.'));
+
+    if(state.phase==='betting' && state.players.length>0 && state.players.every(x=>x.betConfirmed)){
+      dealInitial();
+      return;
+    }
+    if(wasCurrentTurn && state.phase==='playing'){
+      skipToActive();
+      return;
+    }
+    broadcast();
+  }
+
+  function hostKickPlayer(pid){
+    if(!isHost || pid===localId) return;
+    if(conns[pid]){ try{ conns[pid].close(); }catch(e){} delete conns[pid]; }
+    removePlayer(pid, 'kicked');
+  }
+
   // ---------- Public (masked) state for guests ----------
   function publicState(){
     const s=JSON.parse(JSON.stringify(state));
@@ -624,10 +665,7 @@
       conn.on('data', data=>handleHostMessage(conn, data));
       conn.on('close', ()=>{
         delete conns[conn.peer];
-        state.players = state.players.filter(p=>p.id!==conn.peer);
-        state.order = (state.order||[]).filter(id=>id!==conn.peer);
-        log('Ein Spieler hat den Tisch verlassen.');
-        broadcast();
+        if(state.players.find(p=>p.id===conn.peer)) removePlayer(conn.peer, 'left');
       });
     });
     peer.on('disconnected', ()=>{
@@ -796,6 +834,17 @@
       nameDiv.className='name';
       nameDiv.textContent=p.name+(p.id===localId?' (du)':'');
       seat.appendChild(nameDiv);
+
+      if(isHost && p.id!==localId){
+        const kickBtn=document.createElement('button');
+        kickBtn.className='kick-btn';
+        kickBtn.title='Spieler entfernen';
+        kickBtn.textContent='×';
+        kickBtn.onclick=()=>{
+          if(confirm('"'+p.name+'" vom Tisch werfen?')) hostKickPlayer(p.id);
+        };
+        seat.appendChild(kickBtn);
+      }
 
       const chipsDiv=document.createElement('div');
       chipsDiv.className='chips'+((prevP && prevP.chips!==p.chips)?' flash':'');
