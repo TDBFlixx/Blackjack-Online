@@ -342,6 +342,19 @@
   const MIN_BET=10;
   const START_CHIPS=1000;
 
+  // Google STUN + free Open Relay TURN (needed so the connection also works
+  // across mobile networks / strict firewalls, not just on the same WiFi).
+  const ICE_CONFIG = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+    ]
+  };
+  const PEER_OPTS = { debug:0, config: ICE_CONFIG };
+
   function genRoomCode(){
     const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code='';
@@ -577,10 +590,20 @@
   }
 
   // ---------- Host connection handling ----------
-  function setupHost(){
+  function setupHost(attemptsLeft){
+    if(attemptsLeft===undefined) attemptsLeft=5;
     const code=genRoomCode();
-    peer=new Peer(code, {debug:0});
+    if(peer){ try{ peer.destroy(); }catch(e){} }
+    peer=new Peer(code, PEER_OPTS);
+
+    const openTimeout=setTimeout(()=>{
+      showLandingError('Verbindung zum Signalisierungsserver dauert zu lange. Bitte prüfe deine Internetverbindung und versuche es erneut.');
+      setLandingButtonsEnabled(true);
+      try{ peer.destroy(); }catch(e){}
+    }, 15000);
+
     peer.on('open', id=>{
+      clearTimeout(openTimeout);
       localId=id;
       isHost=true;
       state={
@@ -607,8 +630,18 @@
         broadcast();
       });
     });
+    peer.on('disconnected', ()=>{
+      // lost the signaling connection (not the P2P links) - try to recover silently
+      try{ peer.reconnect(); }catch(e){}
+    });
     peer.on('error', err=>{
-      showLandingError('Verbindungsfehler: '+err.type);
+      clearTimeout(openTimeout);
+      if(err.type==='unavailable-id' && attemptsLeft>0){
+        setupHost(attemptsLeft-1); // code collision, try a fresh one
+        return;
+      }
+      setLandingButtonsEnabled(true);
+      showLandingError('Verbindungsfehler: '+err.type+'. Bitte lade die Seite neu und versuche es erneut.');
     });
   }
 
@@ -635,12 +668,29 @@
 
   // ---------- Guest connection handling ----------
   function setupGuest(code){
-    peer=new Peer(undefined,{debug:0});
+    if(peer){ try{ peer.destroy(); }catch(e){} }
+    peer=new Peer(undefined, PEER_OPTS);
+
+    const openTimeout=setTimeout(()=>{
+      showLandingError('Verbindung zum Signalisierungsserver dauert zu lange. Bitte prüfe deine Internetverbindung und versuche es erneut.');
+      setLandingButtonsEnabled(true);
+      try{ peer.destroy(); }catch(e){}
+    }, 15000);
+
     peer.on('open', id=>{
+      clearTimeout(openTimeout);
       localId=id;
       isHost=false;
       hostConn=peer.connect(code, {reliable:true});
+
+      const connectTimeout=setTimeout(()=>{
+        showLandingError('Konnte den Tisch "'+code+'" nicht erreichen. Prüfe den Code und dass der Host noch online ist.');
+        setLandingButtonsEnabled(true);
+        try{ peer.destroy(); }catch(e){}
+      }, 12000);
+
       hostConn.on('open', ()=>{
+        clearTimeout(connectTimeout);
         hostConn.send({type:'join', name:localName});
         showTable();
         document.getElementById('roomCodeDisplay').textContent=code;
@@ -652,11 +702,22 @@
         showLandingError('Die Verbindung zum Tisch wurde getrennt.');
       });
       hostConn.on('error', ()=>{
+        clearTimeout(connectTimeout);
+        setLandingButtonsEnabled(true);
         showLandingError('Tisch nicht gefunden. Prüfe den Code.');
       });
     });
+    peer.on('disconnected', ()=>{
+      try{ peer.reconnect(); }catch(e){}
+    });
     peer.on('error', err=>{
-      showLandingError('Verbindungsfehler: '+err.type+ '. Prüfe den Tisch-Code.');
+      clearTimeout(openTimeout);
+      setLandingButtonsEnabled(true);
+      if(err.type==='peer-unavailable'){
+        showLandingError('Tisch "'+code+'" wurde nicht gefunden. Prüfe den Code.');
+      } else {
+        showLandingError('Verbindungsfehler: '+err.type+'. Bitte lade die Seite neu und versuche es erneut.');
+      }
     });
   }
 
@@ -676,6 +737,10 @@
 
   function showLandingError(msg){
     document.getElementById('landingMsg').textContent=msg;
+  }
+  function setLandingButtonsEnabled(enabled){
+    document.getElementById('hostBtn').disabled=!enabled;
+    document.getElementById('joinBtn').disabled=!enabled;
   }
   function showTable(){
     document.getElementById('landing').style.display='none';
@@ -908,17 +973,23 @@
 
   // ---------- Landing screen wiring ----------
   document.getElementById('hostBtn').onclick=()=>{
+    showLandingError('');
     const name=document.getElementById('nameInput').value.trim();
     if(!name){ showLandingError('Bitte gib deinen Namen ein.'); return; }
+    setLandingButtonsEnabled(false);
     localName=name;
+    showLandingError('Tisch wird eröffnet…');
     setupHost();
   };
   document.getElementById('joinBtn').onclick=()=>{
+    showLandingError('');
     const name=document.getElementById('nameInput').value.trim();
     const code=document.getElementById('codeInput').value.trim().toUpperCase();
     if(!name){ showLandingError('Bitte gib deinen Namen ein.'); return; }
     if(!code){ showLandingError('Bitte gib einen Tisch-Code ein.'); return; }
+    setLandingButtonsEnabled(false);
     localName=name;
+    showLandingError('Verbinde mit Tisch '+code+'…');
     setupGuest(code);
   };
   document.getElementById('copyLinkBtn').onclick=()=>{
